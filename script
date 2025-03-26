@@ -1,0 +1,122 @@
+pipeline {
+    agent any
+    environment {
+        SCANNER_HOME = "/opt/sonar-scanner"
+    }
+    stages {
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                sudo apt update
+                sudo apt install -y openjdk-17-jdk maven
+                java -version
+                mvn -version
+                '''
+            }
+        }
+        stage('Git Checkout') {
+            steps {
+                git branch: 'main', credentialsId: 'token', url: 'https://github.com/Pramodkumarsv/cicd_devops.git'
+            }
+        }
+        stage('Compile') {
+            steps {
+                sh "mvn compile"
+            }
+        }
+        stage('Run Tests') {
+            steps {
+                sh "mvn test"
+            }
+        }
+        stage('Trivy File System Scan') {
+            steps {
+                sh "trivy fs --format table -o trivy-fs-report.html ."
+            }
+        }
+        stage('SonarQube Code Analysis') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh "$SCANNER_HOME/bin/sonar-scanner -Dsonar.projectKey=BoardGame -Dsonar.java.binaries=."
+                }
+            }
+        }
+        stage('Quality Gate Check') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
+                }
+            }
+        }
+        stage('Build Artifact') {
+            steps {
+                sh "mvn package"
+            }
+        }
+        stage('Publish Artifacts to Nexus') {
+            steps {
+                withMaven(globalMavenSettingsConfig: 'global-settings', jdk: 'jdk17', maven: 'maven3', traceability: true) {
+                    sh "mvn deploy"
+                }
+            }
+        }
+        stage('Build and Tag Docker Image') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {
+                        sh "docker build -t pramodkumar054/Boardgame:latest ."
+                    }
+                }
+            }
+        }
+        stage('Docker Image Security Scan') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {
+                        sh "trivy image --format table -o trivy-image-report.html pramodkumar054/Boardgame:latest"
+                    }
+                }
+            }
+        }
+        stage('Push Docker Image to Registry') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {
+                        sh "docker push pramodkumar054/Boardgame:latest"
+                    }
+                }
+            }
+        }
+        stage('Deploy to Kubernetes') {
+            steps {
+                withKubeConfig(credentialsId: 'k8-cred', namespace: 'webapps', serverUrl: 'https://3.92.139.255:6443') {
+                    sh "kubectl apply -f deployment-service.yaml"
+                    sh "kubectl get pods -n webapps"
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                def jobName = env.JOB_NAME
+                def buildNumber = env.BUILD_NUMBER
+                def pipelineStatus = currentBuild.result ?: 'UNKNOWN'
+                def body = """
+                ${jobName} - Build ${buildNumber}
+                Pipeline Status: ${pipelineStatus.toUpperCase()}
+                Check the console output.
+                """
+                emailext(
+                    subject: "${jobName} - Build ${buildNumber} - ${pipelineStatus.toUpperCase()}",
+                    body: body,
+                    to: 'pramodkumarvagannanavar@gmail.com',
+                    from: 'jenkins@example.com',
+                    replyTo: 'jenkins@example.com',
+                    mimeType: 'text/html',
+                    attachmentsPattern: 'trivy-image-report.html'
+                )
+            }
+        }
+    }
+}
